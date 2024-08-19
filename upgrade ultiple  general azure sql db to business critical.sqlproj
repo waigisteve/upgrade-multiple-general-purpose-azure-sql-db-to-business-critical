@@ -1,0 +1,236 @@
+
+<#
+.Description
+
+# This is an upgrade script for upgrading AzureSQL Databases to the desired SKU.    
+# The script covers various scenarios and performs the following tasks:
+
+# Scenarios being tested:
+# 1) Jobs will be executed in parallel.
+# 2) The script will upgrade secondary databases first, then the primary.
+# 3) Upgrade the database based on the primary listed in the database info list.
+# 4) Script will perform the check prior to the migration in case of the role has changed from primary to secondary of the database mentioned in the database info list.
+# 5) Upgrade individual databases in case of no primary/secondary found for a given database.
+# 6) Upgrade the database if secondary is upgraded but primary has not been upgraded. Running the script again will skip the secondary and upgrade the primary database.
+#    In other words, SLO mismatch will be handled based on the SKU defined in the database info list.
+# 7) Track the database progress and display the progress in the console.
+
+
+##Database info list is required in order to perform an upgrade:
+    DatabaseName: Name of the database to be upgraded.
+    PartnerResourceGroupName: Name of the resource group where the secondary database is located.
+    ServerName: Name of the server where the primary database is located.
+    ResourceGroupName : Name of the resource group where the primary database is located
+    RequestedServiceObjectiveName: Desired SKU to be upgraded to.
+   #>
+
+ 
+# Define the list of database information
+$DatabaseInfoList = @(
+  #@{ DatabaseName = '{DatabaseName}'; PartnerResourceGroupName = '{PartnerResourcegroupName}'; ServerName = '{ServerName}'  ; ResourceGroupName = '{ResourceGroupName}'; RequestedServiceObjectiveName =  '{SLODetails}'; subscriptionID = '{SubscriptionID}' }
+   )
+
+# Define the script block that performs the update
+$ScriptBlock = {
+    param (
+        $DatabaseInfo
+    )
+
+    Set-AzContext -subscriptionId $DatabaseInfo.subscriptionID
+
+        ###store output in txt file
+        $OutputFilePath = "C:\temp\$($DatabaseInfo.DatabaseName)_$($env:USERNAME)_$($Job.Id)_Output.txt"
+        $OutputCapture = @()
+        $OutputCapture += "Database: $($DatabaseInfo.DatabaseName)"
+
+    
+    $ReplicationLink = Get-AzSqlDatabaseReplicationLink -DatabaseName $DatabaseInfo.DatabaseName -PartnerResourceGroupName $DatabaseInfo.PartnerResourceGroupName -ServerName $DatabaseInfo.ServerName -ResourceGroupName $DatabaseInfo.ResourceGroupName
+    $PrimaryServerRole = $ReplicationLink.Role
+    $PrimaryResourceGroupName = $ReplicationLink.ResourceGroupName
+    $PrimaryServerName = $ReplicationLink.ServerName
+    $PrimaryDatabaseName = $ReplicationLink.DatabaseName
+
+    $PartnerRole = $ReplicationLink.PartnerRole
+    $PartnerServerName = $ReplicationLink.PartnerServerName
+    $PartnerDatabaseName = $ReplicationLink.PartnerDatabaseName
+    $PartnerResourceGroupName = $ReplicationLink.PartnerResourceGroupName
+
+
+    $UpdateSecondary = $false
+    $UpdatePrimary = $false
+
+    if ($PartnerRole -eq "Secondary" -and $PrimaryServerRole -eq "Primary") {
+        $UpdateSecondary = $true
+        $UpdatePrimary = $true
+    }
+    #For Failover Scenarios only
+    elseif ($PartnerRole -eq "Primary" -and $PrimaryServerRole -eq "Secondary") {
+        $UpdateSecondary = $true
+        $UpdatePrimary = $true
+
+        $PartnerRole = $ReplicationLink.Role
+        $PartnerServerName = $ReplicationLink.ServerName
+        $PartnerDatabaseName = $ReplicationLink.DatabaseName
+        $PartnerResourceGroupName = $ReplicationLink.ResourceGroupName
+        
+        $PrimaryServerRole = $ReplicationLink.PartnerRole
+        $PrimaryResourceGroupName = $ReplicationLink.PartnerResourceGroupName
+        $PrimaryServerName = $ReplicationLink.PartnerServerName
+        $PrimaryDatabaseName = $ReplicationLink.PartnerDatabaseName
+    }
+
+    Try
+    {
+        if ($UpdateSecondary) {
+            $DatabaseProperties = Get-AzSqlDatabase -ResourceGroupName $PartnerResourceGroupName -ServerName $PartnerServerName -DatabaseName $PartnerDatabaseName
+            #$DatabaseEdition = $DatabaseProperties.Edition
+            $DatabaseSKU = $DatabaseProperties.RequestedServiceObjectiveName
+            if ($DatabaseSKU -ne $DatabaseInfo.RequestedServiceObjectiveName)  {
+                Write-host "Secondary started at $(Get-Date) of DB $UpdateSecondary"
+                $OutputCapture += "Secondary started at $(Get-Date) of DB $UpdateSecondary"
+               
+                Set-AzSqlDatabase -ResourceGroupName $PartnerResourceGroupName -DatabaseName $PartnerDatabaseName -ServerName $PartnerServerName -Edition "BusinessCritical"  -RequestedServiceObjectiveName $DatabaseInfo.RequestedServiceObjectiveName
+                Write-host "Secondary end at $(Get-Date)"
+                $OutputCapture += "Secondary end at $(Get-Date)"
+        
+                
+                # Start Track Progress
+                $activities = Get-AzSqlDatabaseActivity -ResourceGroupName $PartnerResourceGroupName -ServerName $PartnerServerName -DatabaseName $PartnerDatabaseName |
+                Where-Object {$_.State -eq "InProgress" -or $_.State -eq "Succeeded" -or $_.State -eq "Failed"} |  Sort-Object -Property StartTime -Descending | Select-Object -First 1
+
+                if ($activities.Count -gt 0) {
+                    Write-Host "Operations in progress or completed for $($PartnerDatabaseName):"
+                    $OutputCapture += "Operations in progress or completed for $($PartnerDatabaseName):"
+                    foreach ($activity in $activities) {
+                    Write-Host "Activity Start Time: $($activity.StartTime) , Activity Estimated Completed Time: $($activity.EstimatedCompletionTime) , Activity ID: $($activity.OperationId), Server Name: $($activity.ServerName), Database Name: $($activity.DatabaseName), Status: $($activity.State), Percent Complete: $($activity.PercentComplete)%, Description: $($activity.Description)"
+                    $OutputCapture += "Activity Start Time: $($activity.StartTime) , Activity Estimated Completed Time: $($activity.EstimatedCompletionTime) , Activity ID: $($activity.OperationId), Server Name: $($activity.ServerName), Database Name: $($activity.DatabaseName), Status: $($activity.State), Percent Complete: $($activity.PercentComplete)%, Description: $($activity.Description)"
+                    }
+                    Write-Host  "$PartnerDatabaseName Upgrade Successfully Completed!"
+                    $OutputCapture += "$PartnerDatabaseName Upgrade Successfully Completed!"
+                } else {
+                    Write-Host "No operations in progress or completed for $($PartnerDatabaseName)"
+                    $OutputCapture += "No operations in progress or completed for $($PartnerDatabaseName)"
+                }
+                # End Track Progress
+               # 
+            }
+            else {
+                Write-host "Database $PartnerDatabaseName is already upgraded."
+                $OutputCapture += "Database $PartnerDatabaseName is already upgraded."
+            }
+        }
+
+        if ($UpdatePrimary) {
+            $DatabaseProperties = Get-AzSqlDatabase -ResourceGroupName $PrimaryResourceGroupName -ServerName $PrimaryServerName -DatabaseName $PrimaryDatabaseName
+           # $DatabaseEdition = $DatabaseProperties.Edition
+            $DatabaseSKU = $DatabaseProperties.RequestedServiceObjectiveName
+            if ($DatabaseSKU -ne $DatabaseInfo.RequestedServiceObjectiveName){
+            Write-host "Primary started at $(Get-Date) of DB $UpdatePrimary"
+            $OutputCapture += "Primary started at $(Get-Date) of DB $UpdatePrimary"
+            Set-AzSqlDatabase -ResourceGroupName $PrimaryResourceGroupName -DatabaseName $PrimaryDatabaseName -ServerName $PrimaryServerName -Edition "BusinessCritical"  -RequestedServiceObjectiveName $DatabaseInfo.RequestedServiceObjectiveName
+            Write-host "Primary end at $(Get-Date)" 
+            $OutputCapture += "Primary end at $(Get-Date)"
+            
+
+            # Start Track Progress
+            $activities = Get-AzSqlDatabaseActivity -ResourceGroupName $PrimaryResourceGroupName -ServerName $PrimaryServerName -DatabaseName $PrimaryDatabaseName |
+            Where-Object {$_.State -eq "InProgress" -or $_.State -eq "Succeeded" -or $_.State -eq "Failed"} |  Sort-Object -Property StartTime -Descending | Select-Object -First 1
+
+            if ($activities.Count -gt 0) {
+                Write-Host "Operations in progress or completed for $($PrimaryDatabaseName):"
+                $OutputCapture += "Operations in progress or completed for $($PrimaryDatabaseName):"
+                foreach ($activity in $activities) {
+                Write-Host "Activity Start Time: $($activity.StartTime) , Activity Estimated Completed Time: $($activity.EstimatedCompletionTime) , Activity ID: $($activity.OperationId), Server Name: $($activity.ServerName), Database Name: $($activity.DatabaseName), Status: $($activity.State), Percent Complete: $($activity.PercentComplete)%, Description: $($activity.Description)"
+                $OutputCapture += "Activity Start Time: $($activity.StartTime) , Activity Estimated Completed Time: $($activity.EstimatedCompletionTime) , Activity ID: $($activity.OperationId), Server Name: $($activity.ServerName), Database Name: $($activity.DatabaseName), Status: $($activity.State), Percent Complete: $($activity.PercentComplete)%, Description: $($activity.Description)"
+                }
+                Write-Host  "$PrimaryDatabaseName Upgrade Successfully Completed!" 
+                $OutputCapture += "$PrimaryDatabaseName Upgrade Successfully Completed!"
+            } else {
+                Write-Host "No operations in progress or completed for $($PrimaryDatabaseName)"
+                $OutputCapture += "No operations in progress or completed for $($PrimaryDatabaseName)"
+            }
+            # End Track Progress
+           #           
+            }
+            else {
+                Write-host "Database $PrimaryDatabaseName is already upgraded."
+                $OutputCapture += "Database $PrimaryDatabaseName is already upgraded."
+            }
+        }
+        
+        if (!$UpdateSecondary -and !$UpdatePrimary) {
+            $DatabaseProperties = Get-AzSqlDatabase -ResourceGroupName $DatabaseInfo.ResourceGroupName -ServerName $DatabaseInfo.ServerName -DatabaseName $DatabaseInfo.DatabaseName
+            # $DatabaseEdition = $DatabaseProperties.Edition
+             $DatabaseSKU = $DatabaseProperties.RequestedServiceObjectiveName
+        If ($DatabaseSKU -ne $DatabaseInfo.RequestedServiceObjectiveName)  {
+            Write-Host "No Replica Found."
+            $OutputCapture += "No Replica Found."
+            Write-host "Upgrade started at $(Get-Date)"
+            $OutputCapture += "Upgrade started at $(Get-Date)"
+            Set-AzSqlDatabase -ResourceGroupName $DatabaseInfo.ResourceGroupName -DatabaseName $DatabaseInfo.DatabaseName -ServerName $DatabaseInfo.ServerName -Edition "BusinessCritical"  -RequestedServiceObjectiveName $DatabaseInfo.RequestedServiceObjectiveName
+            Write-host "Upgrade completed at $(Get-Date)"
+            $OutputCapture += "Upgrade completed at $(Get-Date)"
+
+            # Start Track Progress
+            $activities = Get-AzSqlDatabaseActivity -ResourceGroupName $DatabaseInfo.ResourceGroupName -ServerName $DatabaseInfo.ServerName -DatabaseName $DatabaseInfo.DatabaseName |
+            Where-Object {$_.State -eq "InProgress" -or $_.State -eq "Succeeded" -or $_.State -eq "Failed"} |  Sort-Object -Property StartTime -Descending | Select-Object -First 1
+
+            if ($activities.Count -gt 0) {
+                Write-Host "Operations in progress or completed for $($DatabaseInfo.DatabaseName):"
+                $OutputCapture += "Operations in progress or completed for $($DatabaseInfo.DatabaseName):"
+                foreach ($activity in $activities) {
+                Write-Host "Activity Start Time: $($activity.StartTime) , Activity Estimated Completed Time: $($activity.EstimatedCompletionTime) , Activity ID: $($activity.OperationId), Server Name: $($activity.ServerName), Database Name: $($activity.DatabaseName), Status: $($activity.State), Percent Complete: $($activity.PercentComplete)%, Description: $($activity.Description)"
+                $OutputCapture += "Activity Start Time: $($activity.StartTime) , Activity Estimated Completed Time: $($activity.EstimatedCompletionTime) , Activity ID: $($activity.OperationId), Server Name: $($activity.ServerName), Database Name: $($activity.DatabaseName), Status: $($activity.State), Percent Complete: $($activity.PercentComplete)%, Description: $($activity.Description)"
+                }
+                Write-Host  " "$DatabaseInfo.DatabaseName" Upgrade Successfully Completed!"
+                $OutputCapture += "$($DatabaseInfo.DatabaseName) Upgrade Successfully Completed!"
+            } else {
+                Write-Host "No operations in progress or completed for $($DatabaseInfo.DatabaseName)"
+                $OutputCapture += "No operations in progress or completed for $($DatabaseInfo.DatabaseName)"
+            }
+            # End Track Progress
+           # Write-Host  " "$DatabaseInfo.DatabaseName" Upgrade Successfully Completed!"
+        }
+        else {
+            Write-host "Database "$DatabaseInfo.DatabaseName" is already upgraded."
+            $OutputCapture += "Database $($DatabaseInfo.DatabaseName) is already upgraded."
+        }
+        $OutputCapture += "Secondary started at $(Get-Date) of DB $UpdateSecondary"
+    }
+    }
+    Catch
+    {
+        # Catch any error
+        Write-Output "Error occurred: $_"
+        $OutputCapture += "Error occurred: $_"
+    }
+    Finally
+    {
+        Write-Host "Upgrade Successfully Completed!"
+        $OutputCapture += "Upgrade Successfully Completed!"
+            # Output the captured messages to the file
+            $OutputCapture | Out-File -FilePath $OutputFilePath
+    }
+  
+}
+
+# Loop through each database and start a background job
+foreach ($DatabaseInfo in $DatabaseInfoList) {
+    Start-Job -ScriptBlock $ScriptBlock -ArgumentList $DatabaseInfo
+}
+
+# Wait for all background jobs to complete
+Get-Job | Wait-Job
+
+# Retrieve and display job results
+#Get-Job | Receive-Job
+Get-Job | ForEach-Object {
+    $Job = $_
+    $OutputFilePath = "C:\temp\$($Job.Id)_Output.txt"
+    Receive-Job -Job $Job | Out-File -FilePath $OutputFilePath  # Append job output to the text file
+}
+
+# Clean up background jobs
+Get-Job | Remove-Job -Force
+write-host "Execution Completed successfully."
+$OutputCapture += "Execution Completed successfully."
